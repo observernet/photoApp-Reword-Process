@@ -1,0 +1,512 @@
+/*****************************************************
+ * 프로그램ID	: RewordAutoExchange.pc
+ * 프로그램명	: 자동환전을 한다
+ *****************************************************/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+
+#include <sys/types.h>
+#include <time.h>
+#include <json/json.h>
+
+#include <network.h>
+#include <profile.h>
+#include <ft_common.h>
+#include <ora_common.h>
+
+#include <KASConn_interface.h>
+#include <SyncRedis_interface.h>
+#include "RewordAutoExchange.h"
+
+/*************************************************************************************
+ * 구현 시작..
+ *************************************************************************************/
+
+int main(int argc, char** argv)
+{
+	SetProgramName(argv[0]);
+	
+	/* 서버를 초기화 한다. */
+	InitServer();
+	
+	/* 설정정보를 가져온다 */
+	if ( FetchConfig() == -1 )
+	{
+		goto PROGRAM_END;
+	}
+
+	/* 자동환전을 실행한다 */
+	if ( ProcessAutoExchange() == -1 )
+	{
+		goto PROGRAM_END;
+	}	
+	
+PROGRAM_END:
+	interrupt(0);
+	exit(EXIT_SUCCESS);
+}
+
+/**
+ * 설정정보를 가져온다
+ */
+int FetchConfig()
+{
+	/* 오라클사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+	
+	/* 메모리 초기화 */
+	memset(&config, 0x00, sizeof(REWORD_CONFIG));
+	
+	/* 자동환전금액을 가져온다 */
+	EXEC SQL
+		SELECT AUTO_EXCHANGE INTO :config.auto_exchange_amount
+		FROM CONFIG_REWORD
+		WHERE APP_NAME = 'PhotoApp';
+	
+	if ( _SQLNOTOK )
+	{
+		Log("FetchConfig: 자동환전금액을 가져오는 도중 에러가 발생하였습니다 sqlcode[%d]\n", sqlca.sqlcode);
+		return (-1);
+	}
+
+	/* 환전주소를 가져온다 */
+	EXEC SQL
+		SELECT ADDRESS, WALLET_TYPE, CERT_INFO INTO :config.from_address, :config.wallet_type, :config.cert_info
+		FROM CONFIG_WALLET
+		WHERE APP_NAME = 'PhotoApp'
+		  and PROC_TYPE = 'E'
+		  and IS_USE = 'Y';
+	
+	if ( _SQLNOTOK )
+	{
+		Log("FetchConfig: 환전주소를 가져오는 도중 에러가 발생하였습니다 sqlcode[%d]\n", sqlca.sqlcode);
+		return (-1);
+	}
+	str_trim(config.from_address, TRIM_ALL);
+	str_trim(config.cert_info, TRIM_ALL);
+			
+ 	/* 로그기록 */
+	Log("FetchConfig: 자동환전금액  [%lf]\n", config.auto_exchange_amount);
+ 	Log("FetchConfig: 보상주수      [%s]\n", config.from_address);
+	Log("FetchConfig: 보상주소구분  [%c]\n", config.wallet_type);
+	Log("FetchConfig: 인증정보      [%s]\n", config.cert_info);
+	
+	return (0);
+}
+
+/**
+ * 자동환전을 실행한다
+ */
+int ProcessAutoExchange()
+{
+	char user_key[32];
+	double reword, exchange, obsp;
+
+	/* 오라클사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+
+	/* 고객 OBSP를 가져온다 */
+	EXEC SQL DECLARE _GET_USER_OBSP_LIST CURSOR FOR
+		SELECT USER_KEY, SUM(REWORD), SUM(EXCHANGE)
+		FROM
+		(
+			(
+				SELECT A.USER_KEY, SUM(A.REWORD_AMOUNT) REWORD, 0 EXCHANGE
+				FROM REWORD_DETAIL A, REWORD_LIST B
+				WHERE A.REWORD_IDX = B.REWORD_IDX
+				and B.PROC_STATUS = 'V'
+				GROUP BY A.USER_KEY
+			)
+			UNION ALL
+			(
+				SELECT USER_KEY, 0 REWORD, SUM(PROC_AMOUNT + EXCHANGE_FEE) EXCHANGE
+				FROM EXCHANGE_OBSP
+				WHERE PROC_STATUS = 'V'
+				GROUP BY USER_KEY
+			)
+		)
+		GROUP BY USER_KEY;
+	
+	EXEC SQL OPEN _GET_USER_OBSP_LIST;
+	if ( _SQLOK )
+	{
+		while ( 1 )
+		{
+			EXEC SQL FETCH _GET_USER_OBSP_LIST INTO :user_key, :reword, :exchange;
+
+			if ( _SQLNOTFOUND ) break;
+			str_trim(user_key, TRIM_ALL);
+			obsp = reword - exchange;
+            
+			Log("ProcessAutoExchange: Fetch Info => user_key[%s] obsp[%lf]\n", user_key, obsp);
+
+			/* obsp가 자동환전 금액보다 크다면 */
+			if ( obsp > config.auto_exchange_amount )
+			{
+				sleep(1);
+				if ( TransferExchange(user_key, obsp) == -1 )
+				{
+					Log("ProcessAutoExchange: Transfer ERRROR => user_key[%s] obsp[%lf]\n", user_key, obsp);
+					continue;
+				}
+			}
+		}
+	}
+	else
+	{
+		Log("ProcessAutoExchange: 고객 OBSP 가져오는 도중 에러가 발생하였습니다 sqlcode[%d]\n", sqlca.sqlcode);
+        return (-1);
+	}
+	EXEC SQL CLOSE _GET_USER_OBSP_LIST;
+
+	return (0);
+}
+
+/**
+ * 고객에게 obsr을 전송한다
+ */
+int TransferExchange(char* user_key, double obsp)
+{
+	char to_address[64];
+	int exchange_idx;
+
+	char* KASConnRes;
+	json_object *myobj;
+	int success;
+	char* msg;
+
+	/* 오라클사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+
+	/* 고객 지갑정보를 가져온다 */
+	EXEC SQL
+		SELECT ADDRESS INTO :to_address
+		FROM WALLET_INFO
+		WHERE USER_KEY = :user_key
+		  and IS_USE = 'Y';
+	
+	if ( _SQLNOTOK )
+	{
+		Log("TransferExchange: 고객지갑을 가져오는 도중 에러가 발생하였습니다 user_key[%s] sqlcode[%d]\n", user_key, sqlca.sqlcode);
+		return (-1);
+	}
+	str_trim(to_address, TRIM_ALL);
+
+	/* 환전내역을 삽입한다 */
+	EXEC SQL SELECT NVL(MAX(EXCHANGE_IDX), 0) + 1 INTO :exchange_idx FROM EXCHANGE_OBSP;
+	EXEC SQL
+		INSERT INTO EXCHANGE_OBSP (EXCHANGE_IDX, USER_KEY, REQ_TYPE, REQ_TIME, REQ_AMOUNT, FROM_ADDRESS, TO_ADDRESS, EXCHANGE_FEE, PROC_STATUS, UPDATE_TIME)
+						   VALUES (:exchange_idx, :user_key, 'S', sysdate, :obsp, :config.from_address, :to_address, 0, 'A', sysdate);
+	
+	if ( _SQLNOTOK )
+	{
+		Log("TransferExchange: 환전내역을 삽입하는 도중 에러가 발생하였습니다. user_key[%s] sqlcode[%d]\n", user_key, sqlca.sqlcode);
+		EXEC SQL ROLLBACK;
+		return (-1);
+	}
+	EXEC SQL COMMIT;
+
+	/* 환전금액을 전송한다 */
+	if ( !(KASConnRes = SendTransferToKASConn(user_key, config.from_address, to_address, obsp, config.wallet_type, config.cert_info)) )
+	{
+		Log("TransferExchange: KASConn 요청 중 에러가 발생하였습니다 user_key[%s]\n", user_key);
+		return (-1);
+	}
+
+	/* 읽어 들여온 데이타를 파싱한다 */
+	myobj = json_tokener_parse(KASConnRes);
+	success = json_object_get_boolean(json_object_object_get(myobj, "success"));
+	msg = json_object_get_string(json_object_object_get(myobj, "msg"));
+
+	/* 전송결과에 따라 */
+	if ( success )
+	{
+		/* 환전 내역에 데이타키를 세팅한다 */
+		EXEC SQL
+			UPDATE EXCHANGE_OBSP SET KASCONN_KEY = :msg WHERE EXCHANGE_IDX = :exchange_idx;
+
+		if ( _SQLNOTOK )
+		{
+			Log("TransferExchange: 환전내역을 갱신(성공)하는 도중 에러가 발생하였습니다. user_key[%s] sqlcode[%d]\n", user_key, sqlca.sqlcode);
+			EXEC SQL ROLLBACK;
+			return (-1);
+		}
+		EXEC SQL COMMIT;
+
+		Log("TransferExchange: OBSR 전송완료 => user_key[%s] to_address[%s] OBSR[%.8lf] key[%s]\n", user_key, to_address, obsp, msg);
+
+		/* REDIS 유저정보를 갱신한다 */
+		UpdateUserInfoRedis(user_key);
+	}
+	else
+	{
+		/* 환전을 거부처리한다 */
+		EXEC SQL
+			UPDATE EXCHANGE_OBSP SET PROC_TIME = sysdate, PROC_AMOUNT = 0, EXCHANGE_FEE = 0, PROC_STATUS = 'Z', MEMO = :msg, UPDATE_TIME = sysdate
+			WHERE EXCHANGE_IDX = :exchange_idx;
+
+		if ( _SQLNOTOK )
+		{
+			Log("TransferExchange: 환전내역을 갱신(실패)하는 도중 에러가 발생하였습니다. user_key[%s] sqlcode[%d]\n", user_key, sqlca.sqlcode);
+			EXEC SQL ROLLBACK;
+			return (-1);
+		}
+		EXEC SQL COMMIT;
+
+		Log("TransferExchange: OBSR 전송실패 => user_key[%s] to_address[%s] OBSR[%.8lf] msg[%s]\n", user_key, to_address, obsp, msg);
+	}
+
+	return (0);
+}
+
+/**
+ * OBSR을 KASConn으로 전송한다
+ */
+char* SendTransferToKASConn(char* user_key, char* from_address, char* to_address, double amount, char acctype, char* cert_info)
+{
+	static char resdata[MAX_BUFFER];
+
+	char sndbuf[MAX_BUFFER], rcvbuf[MAX_BUFFER], tmpbuf[32];
+	KI_REQRES_HEADER* pHeader;
+	char* pData;
+	int length;
+
+	/* 서버에 연결한다 */
+	if ( KASConn_sockfd == -1 )
+	{
+		if ( ConnectKASConn() == -1 )
+		{
+			Log("SendTransferToKASConn: KASConn 연결실패!!");
+			return (NULL);
+		}
+	}
+
+	/* 메모리초기화 */
+	memset(sndbuf, 0x00, MAX_BUFFER);
+	pHeader = (KI_REQRES_HEADER*)sndbuf;
+	pData = sndbuf + sizeof(KI_REQRES_HEADER);
+
+	/* 보낼 데이타를 세팅한다 */
+	sprintf(pData, "{\"sender\":\"%s\", \"recipient\":\"%s\", \"amount\":\"%.8lf\", \"cert\":\"%s\"}", from_address, to_address, amount, cert_info);
+	pHeader->trid = KI_TRID_TRANSFER;
+	pHeader->req_type = KI_REQTYPE_TRANSACT;
+	sprintf(pHeader->service_name, "%-16s", KASConn_service_name);
+	pHeader->account_type = acctype;
+	sprintf(pHeader->account_group, "%-16s", KASConn_account_pool);
+	sprintf(pHeader->user_key, "E:%-30s", user_key);
+	sprintf(tmpbuf, "%0*d", KI_BODY_LENGTH, strlen(pData)); memcpy(pHeader->body_length, tmpbuf, KI_BODY_LENGTH);
+
+	/* 데이타를 전송한다 */
+    if ( SendTCP(KASConn_sockfd, sndbuf, strlen(sndbuf), &timeover) == -1 )
+    {
+        Log("SendTransferToKASConn: 데이타 전송 실패! errno[%d]\n", errno);
+		CloseSocket(KASConn_sockfd); KASConn_sockfd = -1;
+		return (NULL);
+    }
+	//printf("Send [%s]\n", sndbuf);
+
+	/* 응답데이타를 수신한다 */
+    memset(rcvbuf, 0x00, MAX_BUFFER);
+    if ( ReceiveTCP(KASConn_sockfd, rcvbuf, sizeof(KI_REQRES_HEADER), &timeover) <= 0 )
+    {
+        Log("SendTransferToKASConn: 헤더 수신 실패! errno[%d]\n", errno);
+		CloseSocket(KASConn_sockfd); KASConn_sockfd = -1;
+		return (NULL);
+    }
+	pHeader = (KI_REQRES_HEADER*)rcvbuf;
+    length = atoi(pHeader->body_length);
+
+    /* 나머지 데이타를 읽어온다 */
+    if ( length > 0 )
+    {
+        if ( ReceiveTCP(KASConn_sockfd, rcvbuf+sizeof(KI_REQRES_HEADER), length, &timeover) <= 0 )
+        {
+            Log("SendTransferToKASConn: 데이타 수신 실패! errno[%d]\n", errno);
+			CloseSocket(KASConn_sockfd); KASConn_sockfd = -1;
+			return (NULL);
+        }
+    }
+	//printf("Recv [%s]\n", rcvbuf);
+
+	/* 응답데이타를 세팅한다 */
+	memset(resdata, 0x00, MAX_BUFFER);
+	sprintf(resdata, "%s", rcvbuf+sizeof(KI_REQRES_HEADER));
+
+	return (resdata);
+}
+
+/**
+ * KASConn 서버에 연결한다
+ */
+int ConnectKASConn()
+{
+	KI_REQRES_HEADER header;
+
+	/* 서버 접속 */
+	if ( (KASConn_sockfd = GetConnectSocket(KASConn_ip, KASConn_port)) == -1 )
+	{
+		Log("ConnectKASConn: 서버 연결 실패! [%s:%d] errno[%d]\n", KASConn_ip, KASConn_port, errno);
+		return (-1);
+	}
+
+	/* 서버 로그인 */
+	memset(&header, 0x00, sizeof(KI_REQRES_HEADER));
+	header.trid = KI_TRID_LOGIN;
+	header.req_type = KI_REQTYPE_LOGIN;
+	sprintf(header.service_name, "%-16s", KASConn_service_name);
+	header.account_type = ' ';
+	sprintf(header.account_group, "%-16s", KASConn_account_pool);
+	sprintf(header.user_key, "%-32s", " ");
+	sprintf(header.body_length, "%*d", KI_BODY_LENGTH, 0);
+
+	if ( SendTCP(KASConn_sockfd, (char*)&header, sizeof(KI_REQRES_HEADER), &timeover) == -1 )
+	{
+		Log("ConnectKASConn: 데이타 전송 실패! errno[%d]\n", errno);
+		CloseSocket(KASConn_sockfd); KASConn_sockfd = -1;
+		return (-1);
+	}
+
+	Log("ConnectKASConn: 서버 연결 성공! [%s:%d]\n", KASConn_ip, KASConn_port);
+	return (0);
+}
+
+/**
+ * REDIS의 사용자 통계정보를 갱신한다
+ */
+int UpdateUserInfoRedis(char* user_key)
+{
+	SOCKET sockfd;
+    char key[128];
+    char sndbuf[MAX_BUFFER], rcvbuf[MAX_BUFFER];
+    int length;
+
+	/* 서버연결 */
+    if ( (sockfd = GetConnectSocket(syncredis_ip, syncredis_port)) == -1 )
+    {
+        Log("UpdateUserInfoRedis: 서버 접속에 실패하였습니다!! host[%s:%d] errno[%d]\n", syncredis_ip, syncredis_port, errno);
+        return (-1);
+    }
+
+	/* 보낼데이타를 세팅한다 */
+	memset(key, 0x00, 128);
+	memset(sndbuf, 0x00, MAX_BUFFER);
+	sprintf(key, "PhotoApp:UserInfo:%s:stat", user_key);
+	sprintf(sndbuf, "%0*ld%c%s", SRI_LENGTH_SIZE, strlen(key) + 1, 'U', key);
+
+	/* 데이타를 전송한다 */
+	if ( SendTCP(sockfd, sndbuf, strlen(sndbuf), 0) == -1 )
+	{
+		Log("UpdateUserInfoRedis: 데이타 전송에 실패하였습니다. sndbuf[%s] errno[%d]\n", sndbuf, errno);
+		return (-1);
+	}
+
+	/* 응답데이타를 읽어온다 */
+	memset(rcvbuf, 0x00, MAX_BUFFER);
+	if ( ReceiveTCP(sockfd, rcvbuf, SRI_LENGTH_SIZE, 0) <= 0 )
+	{
+		Log("UpdateUserInfoRedis: 응답 사이즈 수신에 실패하였습니다. errno[%d]\n", errno);
+		return (-1);
+	}
+	if ( (length = atoi(rcvbuf)) > 0 )
+	{
+		if ( ReceiveTCP(sockfd, rcvbuf + SRI_LENGTH_SIZE, length, 0) <= 0 )
+		{
+			Log("UpdateUserInfoRedis: 응답 데이타 수신에 실패하였습니다. errno[%d]\n", errno);
+			return (-1);
+		}
+	}
+
+    CloseSocket(sockfd);
+
+	return (0);
+}
+
+/*************************************************************************************
+ * 초기화 함수
+ *************************************************************************************/
+
+/**
+ * 서버를 초기화한다.
+ */ 
+void InitServer()
+{
+	char db_user[32], conf_file_name[128];;
+	struct sqlca sqlca;
+	
+	/* 공유메모리를 초기화 한다. */
+	InitCommonMemory();
+	
+	/* 설정파일을 연다. */
+	sprintf(conf_file_name, "%s/%s/%s", mdb->program_home, CONF_PATH, SERVER_CONFIG_FILE);
+	if ( !OpenProfile(conf_file_name) )
+	{
+		Log("InitServer: 설정파일을 여는 도중 에러가 발생하였습니다. file[%s] errno[%d]\n", conf_file_name, errno);
+		exit(EXIT_FAILURE);
+	}
+
+	/* DB연결정보를 가져온다 */
+	GetProfileString("MAIN", "ORACLE_USER", db_user);
+
+	/* KASConn 정보를 가져온다 */
+	GetProfileString("KASConn", "SERVER_IP", KASConn_ip);
+	GetProfileString("KASConn", "SERVICE_NAME", KASConn_service_name);
+	GetProfileString("KASConn", "ACCOUNT_POOL", KASConn_account_pool);
+	KASConn_port = GetProfileInt("KASConn", "SERVER_PORT", 0);
+	if ( KASConn_port <= 0 )
+	{
+		Log("InitServer: 설정파일에 KASConn 정보가 없습니다\n");
+		exit(EXIT_FAILURE);
+	}
+	GetProfileString("SyncRedis", "SERVER_IP", syncredis_ip);
+	syncredis_port = GetProfileInt("SyncRedis", "SERVER_PORT", 0);
+
+	/* 설정파일을 닫는다. */
+	CloseProfile();
+
+	/* 메모리 초기화 */
+	timeover.tv_sec = 60; timeover.tv_usec = 0;
+	
+ 	/* DB에 접속한다. */
+	EXEC SQL CONTEXT ALLOCATE :ctx;
+	EXEC SQL CONTEXT USE :ctx;
+	EXEC SQL CONNECT :db_user;
+
+	/* 시스널 핸들러 설정 */
+	signal(SIGHUP, SIG_IGN);
+	signal(SIGPIPE, SIG_IGN);
+	signal(SIGINT, interrupt);
+    signal(SIGTERM, interrupt);
+    signal(SIGQUIT, interrupt);
+    
+	Log("InitServer: 서버 초기화! Process Start..................................\n");
+}
+
+/**
+ * 서버를 종료한다.
+ */
+void interrupt(int sig)
+{
+	struct sqlca sqlca;
+
+	/* KASConn 연결 종료 */
+	if ( KASConn_sockfd != -1 ) CloseSocket(KASConn_sockfd);
+
+	/* DB연결을 종료한다. */
+	EXEC SQL CONTEXT USE :ctx;
+	EXEC SQL COMMIT WORK RELEASE;
+	EXEC SQL CONTEXT FREE :ctx;
+	
+	/* 프로세스 등록 해제 */
+	DeAttachShm((void*)mdb);
+	
+    exit(EXIT_SUCCESS);
+}
+

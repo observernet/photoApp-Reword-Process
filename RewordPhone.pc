@@ -1,0 +1,711 @@
+/*****************************************************
+ * 프로그램ID	: RewordPhone.pc
+ * 프로그램명	: 스냅/라벨을 보상한다
+ *****************************************************/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <signal.h>
+#include <errno.h>
+
+#include <sys/types.h>
+#include <time.h>
+
+#include <network.h>
+#include <profile.h>
+#include <ft_common.h>
+#include <ora_common.h>
+
+#include <SyncRedis_interface.h>
+#include "RewordPhone.h"
+
+/*************************************************************************************
+ * 구현 시작..
+ *************************************************************************************/
+
+int main(int argc, char** argv)
+{
+	int rcode = 0;
+
+	SetProgramName(argv[0]);
+	if ( argc == 2 )
+	{
+		char stime[32];
+		struct tm tm;
+
+		sprintf(stime, "%s%06d", argv[1], 0);
+		strptime(stime, "%Y%m%d%H%M%S", &tm);
+		input_time = mktime(&tm);
+	}
+	else
+		input_time = 0;
+	
+	/* 서버를 초기화 한다. */
+	InitServer();
+
+	/* 설정정보를 가져온다 */
+	if ( (rcode = FetchConfig()) == -1 )
+	{
+		goto PROGRAM_END;
+	}
+
+	/* 당일 라벨한 정보를 가져온다 */
+	if ( (rcode = FetchTodayLabelAndCalcPass()) == -1 )
+	{
+		goto PROGRAM_END;
+	}
+
+	/* 스냅과 라벨에 RP를 부여한다 */
+	if ( (rcode = UpdateRewordPoint()) == -1 )
+	{
+		goto PROGRAM_END;
+	}
+	
+	/* 유저별 통계정보를 가져온다 */
+	if ( (rcode = FetchRewordUser()) == -1 )
+	{
+		goto PROGRAM_END;
+	}
+
+	/* OBSP를 보상한다 */
+	if ( (rcode = RewordOBSP()) == -1 )
+	{
+		goto PROGRAM_END;
+	}
+	
+	/* 보상을 완료한다 */
+	CompleteReword();
+	
+PROGRAM_END:
+	interrupt(rcode);
+	exit(EXIT_SUCCESS);
+}
+
+/**
+ * 설정정보를 가져온다
+ */
+int FetchConfig()
+{	
+	time_t  timer;
+
+	/* 오라클사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+	
+	/* 메모리 초기화 */
+	memset(&config, 0x00, sizeof(REWORD_CONFIG));
+	
+	/* 실행시간을 결정한다 */
+	if ( input_time == 0 ) (void)time(&timer);
+	else				   timer = input_time;
+	config.reword_date = intDateFrom(timer);
+	config.target_date = intDateFrom(timer - 86400);
+	
+	/* 하루총보상수량을 가져온다 */
+	EXEC SQL
+		SELECT SNAP, LABEL, LABEL_ETC, OBSP_PER_DAY INTO :config.rp_snap, :config.rp_label, :config.rp_label_etc, :config.obsp_per_day
+		FROM CONFIG_REWORD
+		WHERE APP_NAME = 'PhotoApp';
+	
+	if ( _SQLNOTOK )
+	{
+		Log("FetchConfig: 하루총보상수량을 가져오는 도중 에러가 발생하였습니다. sqlcode[%d]\n", sqlca.sqlcode);
+ 		return (-1);
+	}
+
+	/* 보상 접수 상태를 기록한다 */
+	EXEC SQL SELECT NVL(MAX(REWORD_IDX), 0) + 1 INTO :config.reword_idx FROM REWORD_LIST;
+	EXEC SQL
+		INSERT INTO REWORD_LIST (REWORD_IDX, REWORD_TYPE, DEVICE, REWORD_DATE, TARGET_DATE, PROC_STATUS, UPDATE_TIME)
+						 VALUES (:config.reword_idx, 'R', 'P', :config.reword_date, :config.target_date, 'A', sysdate);
+	if ( _SQLNOTOK )
+	{
+		Log("FetchConfig: 보상 접수 기록 도중 에러가 발생하였습니다. sqlcode[%d]\n", sqlca.sqlcode);
+		EXEC SQL ROLLBACK;
+ 		return (-1);
+	}
+	EXEC SQL COMMIT;
+			
+ 	/* 로그기록 */
+	Log("FetchConfig: 보상 INDEX       [%d]\n", config.reword_idx);
+ 	Log("FetchConfig: 보상 날짜        [%d]\n", config.reword_date);
+	Log("FetchConfig: 보상 대상일      [%d]\n", config.target_date);
+	Log("FetchConfig: 하루총보상수량   [%.2lf]\n", config.obsp_per_day);
+	Log("FetchConfig: RP - Snap[%.2lf] Label[%.2lf] LabelEtc[%.2lf]\n", config.rp_snap, config.rp_label, config.rp_label_etc);
+	
+	return (0);
+}
+
+/**
+ * 당일 라벨을 한 스냅의 모든 라벨정보를 가져와 패스여부를 판단한다
+ */
+int qsort_label_count(const void* a, const void* b) { return ( ((SLABEL*)b)->count - ((SLABEL*)a)->count ); }
+int	FetchTodayLabelAndCalcPass()
+{
+	char logs[MAX_BUFFER];
+
+	int i, j, k;
+	SNAP fsnap;
+
+	/* 오라클사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+
+	/* 메모리 초기화 */
+	snap_count = 0; snap = NULL;
+
+	/* 당일 라벨이 있는 스냅정보를 가져온다 */
+	EXEC SQL DECLARE _GET_SANP_LIST CURSOR FOR
+		SELECT distinct SNAP_DATE, SNAP_IDX
+		FROM SNAP_LABEL
+		WHERE TO_CHAR(LABEL_TIME, 'RRRRMMDD') = :config.target_date;
+	
+	EXEC SQL OPEN _GET_SANP_LIST;
+	if ( _SQLOK )
+	{
+		while ( 1 )
+		{
+			memset(&fsnap, 0x00, sizeof(SNAP));
+			EXEC SQL FETCH _GET_SANP_LIST INTO :fsnap.snap_date, :fsnap.snap_idx;
+			if ( _SQLNOTFOUND ) break;
+            
+			/* 해당스냅의 모든 라벨을 가져온다 */
+			EXEC SQL DECLARE _GET_LABEL_LIST CURSOR FOR
+				SELECT LABEL_IDX, TO_CHAR(LABEL_TIME, 'RRRRMMDD'), STATUS, SKY, RAIN, NVL(WCONDI, ' '), NVL(CALAMITY, ' '), NVL(ACCUSE, ' '), IS_ETC
+				FROM SNAP_LABEL
+				WHERE SNAP_DATE = :fsnap.snap_date
+				  and SNAP_IDX = :fsnap.snap_idx;
+			
+			EXEC SQL OPEN _GET_LABEL_LIST;
+			if ( _SQLOK )
+			{
+				int label_idx, label_date;
+				char status, sky, rain, wcondi, calamitu, accuse, is_etc;
+
+				while ( 1 )
+				{
+					EXEC SQL FETCH _GET_LABEL_LIST INTO :label_idx, :label_date, :status, :sky, :rain, :wcondi, :calamitu, :accuse, :is_etc;
+					if ( _SQLNOTFOUND ) break;
+
+					/* 라벨정보를 세팅한다 */
+					fsnap.label[fsnap.label_count].label_idx = label_idx;
+					fsnap.label[fsnap.label_count].is_today = 'N';
+					if ( label_date == config.target_date ) fsnap.label[fsnap.label_count].is_today = 'Y';
+
+					if ( status == '0' ) sprintf(fsnap.label[fsnap.label_count].slabel, "%c%c%c", status, sky, rain);
+					else				 sprintf(fsnap.label[fsnap.label_count].slabel, "%c%c", status, accuse);
+
+					fsnap.label[fsnap.label_count].is_etc = is_etc;
+					if ( is_etc == 'Y' ) sprintf(fsnap.label[fsnap.label_count].slabel_etc, "%c%c", wcondi, calamitu);
+
+					fsnap.label_count++;
+				}
+			}
+			else
+			{
+				Log("FetchTodayLabelAndCalcPass: 라벨 리스트를 가져오는 도중 에러가 발생하였습니다 snapkey[%d:%d] sqlcode[%d]\n", fsnap.snap_date, fsnap.snap_idx, sqlca.sqlcode);
+       			return (-1);
+			}
+			EXEC SQL CLOSE _GET_LABEL_LIST;
+
+			/* 스냅정보를 세팅한다 */
+			snap = (SNAP*)realloc(snap, sizeof(SNAP)*(snap_count+1));
+			memcpy(&snap[snap_count], &fsnap, sizeof(SNAP));
+			snap_count++;
+
+			Log("FetchTodayLabelAndCalcPass: Load Snap [%d:%d] LabelCount[%d]\n", fsnap.snap_date, fsnap.snap_idx, fsnap.label_count);
+		}
+	}
+	else
+	{
+		Log("FetchTodayLabelAndCalcPass: 스냅 리스트를 가져오는 도중 에러가 발생하였습니다 sqlcode[%d]\n", sqlca.sqlcode);
+        return (-1);
+	}
+	EXEC SQL CLOSE _GET_SANP_LIST;
+
+	/* PASS 라벨을 결정한다 */
+	for ( i = 0 ; i < snap_count ; i++ )
+	{
+		for ( j = 0 ; j < snap[i].label_count ; j++ )
+		{
+			// 일반라벨
+			for ( k = 0 ; k < snap[i].slabel_count ; k++ )
+			{
+				if ( strcmp(snap[i].label[j].slabel, snap[i].slabel[k].string) == 0 )
+				{
+					snap[i].slabel[k].count++;
+					break;
+				}
+			}
+			if ( k >= snap[i].slabel_count )
+			{
+				strcpy(snap[i].slabel[snap[i].slabel_count].string, snap[i].label[j].slabel);
+				snap[i].slabel[snap[i].slabel_count].count = 1;
+				snap[i].slabel_count++;
+			}
+
+			// 기타라벨
+			if ( snap[i].label[j].is_etc == 'Y' )
+			{
+				for ( k = 0 ; k < snap[i].slabel_etc_count ; k++ )
+				{
+					if ( strcmp(snap[i].label[j].slabel_etc, snap[i].slabel_etc[k].string) == 0 )
+					{
+						snap[i].slabel_etc[k].count++;
+						break;
+					}
+				}
+				if ( k >= snap[i].slabel_etc_count )
+				{
+					strcpy(snap[i].slabel_etc[snap[i].slabel_etc_count].string, snap[i].label[j].slabel_etc);
+					snap[i].slabel_etc[snap[i].slabel_etc_count].count = 1;
+					snap[i].slabel_etc_count++;
+				}
+			}
+		}
+
+		// 데이타를 정렬한다
+		qsort(snap[i].slabel, snap[i].slabel_count, sizeof(SLABEL), qsort_label_count);
+		qsort(snap[i].slabel_etc, snap[i].slabel_etc_count, sizeof(SLABEL), qsort_label_count);
+
+		// 패스 라벨 INDEX를 결정한다
+		snap[i].slabel_pass_idx = 0;
+		for ( j = 1 ; j < snap[i].slabel_count ; j++ )
+		{
+			if ( snap[i].slabel[j].count != snap[i].slabel[0].count )
+				break;
+			
+			snap[i].slabel_pass_idx = j;
+		}
+		sprintf(logs, "FetchTodayLabelAndCalcPass: Snap[%d:%d] Pass[", snap[i].snap_date, snap[i].slabel_count);
+		for ( j = 0 ; j <= snap[i].slabel_pass_idx ; j++ ) sprintf(&logs[strlen(logs)], "%s ", snap[i].slabel[j].string);
+
+		// 패스 기타 라벨 INDEX를 결정한다
+		snap[i].slabel_etc_pass_idx = 0;
+		for ( j = 1 ; j < snap[i].slabel_etc_count ; j++ )
+		{
+			if ( snap[i].slabel_etc[j].count != snap[i].slabel_etc[0].count )
+				break;
+			
+			snap[i].slabel_etc_pass_idx = j;
+		}
+		sprintf(&logs[strlen(logs)], "] Etc[");
+		for ( j = 0 ; j <= snap[i].slabel_etc_pass_idx ; j++ ) sprintf(&logs[strlen(logs)], "%s ", snap[i].slabel_etc[j].string);
+		Log("%s]\n", logs);
+	}
+
+	return (0);
+}
+
+/**
+ * 스냅와 라벨의 RP를 갱신한다
+ */
+int UpdateRewordPoint()
+{
+	int i, j, k;
+	double rp_label, rp_label_etc;
+
+	/* 오라클 사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+
+	/* 대상일의 스냅에 RP를 세팅한다 */
+	EXEC SQL
+		UPDATE SNAP SET RP = :config.rp_snap, REWORD_IDX = :config.reword_idx
+		WHERE SNAP_DATE = :config.target_date and UPLOAD_STATUS = 'V';
+	
+	if ( _SQLERROR )
+	{
+		Log("UpdateRewordPoint: 스냅 RP를 갱신하는 도중 에러가 발생하였습니다. sqlcode[%d]\n", sqlca.sqlcode);
+		EXEC SQL ROLLBACK;
+		return (-1);
+	}
+	Log("UpdateRewordPoint: Snap RP 갱신 완료 date[%d]\n", config.target_date);
+
+	/* 당일 라벨의 RP를 세팅한다 */
+	for ( i = 0 ; i < snap_count ; i++ )
+	{
+		for ( j = 0 ; j < snap[i].label_count ; j++ )
+		{
+			if ( snap[i].label[j].is_today == 'Y' )
+			{
+				rp_label = rp_label_etc = 0;
+
+				/* 라벨의 패스여부를 판단한다 */
+				for ( k = 0 ; k <= snap[i].slabel_pass_idx ; k++ )
+				{
+					if ( strcmp(snap[i].label[j].slabel, snap[i].slabel[k].string) == 0 )
+					{
+						rp_label = config.rp_label;
+						break;
+					}
+				}
+
+				/* 기타 라벨의 패스여부를 판단한다 */
+				if ( snap[i].label[j].is_etc == 'Y' )
+				{
+					for ( k = 0 ; k <= snap[i].slabel_etc_pass_idx ; k++ )
+					{
+						if ( strcmp(snap[i].label[j].slabel_etc, snap[i].slabel_etc[k].string) == 0 )
+						{
+							rp_label_etc = config.rp_label_etc;
+							break;
+						}
+					}
+				}
+
+				/* 라벨의 RP를 갱신한다 */
+				EXEC SQL
+					UPDATE SNAP_LABEL SET RP = :rp_label, RP_ETC = :rp_label_etc, REWORD_IDX = :config.reword_idx
+					WHERE SNAP_DATE = :snap[i].snap_date
+					  and SNAP_IDX = :snap[i].snap_idx
+					  and LABEL_IDX = :snap[i].label[j].label_idx;
+				
+				if ( _SQLERROR )
+				{
+					Log("UpdateRewordPoint: 라벨 RP를 갱신하는 도중 에러가 발생하였습니다. snap[%d:%d] idx[%d] sqlcode[%d]\n", snap[i].snap_date, snap[i].snap_idx, snap[i].label[j].label_idx, sqlca.sqlcode);
+					EXEC SQL ROLLBACK;
+					return (-1);
+				}
+				Log("UpdateRewordPoint: Label RP 갱신 완료 snap[%d:%d] idx[%d] label[%.2lf] label_etc[%.2lf]\n", snap[i].snap_date, snap[i].snap_idx, snap[i].label[j].label_idx, rp_label, rp_label_etc);
+			}
+		}
+	}
+
+	return (0);
+}
+
+/**
+ * 유저별 통계정보를 가져온다
+ */
+int FetchRewordUser()
+{
+	REWORD_USER fuser;
+
+	/* 오라클 사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+
+	/* 메모리 초기화 */
+	user_count = 0; user = NULL;
+
+	/* 유저별로 스냅 & 라벨 통계값을 가져온다 */
+	EXEC SQL DECLARE _GET_SNAP_STAT CURSOR FOR
+		SELECT USER_KEY, sum(S), sum(C)
+		FROM
+		(
+			(
+				SELECT USER_KEY, SUM(RP) S, count(SNAP_IDX) C
+				FROM SNAP
+				WHERE REWORD_IDX = :config.reword_idx
+				GROUP BY USER_KEY
+			)
+			UNION ALL
+			(
+				SELECT USER_KEY, 0 S, 0 C
+				FROM SNAP_LABEL
+				WHERE REWORD_IDX = :config.reword_idx
+				GROUP BY USER_KEY
+			)
+		)
+		GROUP BY USER_KEY;
+	/*
+		SELECT USER_KEY, SUM(RP), count(SNAP_IDX)
+		FROM SNAP
+		WHERE REWORD_IDX = :config.reword_idx
+		GROUP BY USER_KEY;
+	*/
+	
+	EXEC SQL OPEN _GET_SNAP_STAT;
+	if ( _SQLOK )
+	{
+		while ( 1 )
+		{
+			memset(&fuser, 0x00, sizeof(REWORD_USER));
+			EXEC SQL FETCH _GET_SNAP_STAT INTO :fuser.user_key, :fuser.rp_snap, :fuser.count_snap;
+
+			if ( _SQLNOTFOUND ) break;
+			str_trim(fuser.user_key, TRIM_ALL);
+
+			/* 해당유저의 라벨통계를 가져온다 */
+			EXEC SQL
+				SELECT SUM(RP), COUNT(LABEL_IDX) INTO :fuser.rp_label, :fuser.count_label
+				FROM SNAP_LABEL
+				WHERE USER_KEY = :fuser.user_key
+				  and REWORD_IDX = :config.reword_idx;
+			
+			if ( _SQLERROR )
+			{
+				Log("FetchRewordUser: 라벨 통계를 가져오는 도중 에러가 발생하였습니다 user_key[%s] sqlcode[%d]\n", fuser.user_key, sqlca.sqlcode);
+				EXEC SQL ROLLBACK;
+				return (-1);
+			}
+
+			/* 해당유저의 기타 라벨통계를 가져온다 */
+			EXEC SQL
+				SELECT SUM(RP_ETC), COUNT(LABEL_IDX) INTO :fuser.rp_label_etc, :fuser.count_label_etc
+				FROM SNAP_LABEL
+				WHERE USER_KEY = :fuser.user_key
+				  and REWORD_IDX = :config.reword_idx
+				  and IS_ETC = 'Y';
+			
+			if ( _SQLERROR )
+			{
+				Log("FetchRewordUser: 기타 라벨 통계를 가져오는 도중 에러가 발생하였습니다 user_key[%s] sqlcode[%d]\n", fuser.user_key, sqlca.sqlcode);
+				EXEC SQL ROLLBACK;
+				return (-1);
+			}
+
+			/* 유저정보를 세팅한다 */
+			user = (REWORD_USER*)realloc(user, sizeof(REWORD_USER)*(user_count+1));
+			memcpy(&user[user_count], &fuser, sizeof(REWORD_USER));
+			user_count++;
+
+			Log("FetchRewordUser: user_key[%s] snap[%d:%.2lf] label[%d:%.2lf] label_etc[%d:%.2lf]\n", fuser.user_key, fuser.count_snap, fuser.rp_snap, fuser.count_label, fuser.rp_label, fuser.count_label_etc, fuser.rp_label_etc);
+		}
+	}
+	else
+	{
+		Log("RewordOBSP: 스냅 통계를 가져오는 도중 에러가 발생하였습니다 sqlcode[%d]\n", sqlca.sqlcode);
+		EXEC SQL ROLLBACK;
+		return (-1);
+	}
+	EXEC SQL CLOSE _GET_SNAP_STAT;
+
+	return (0);
+}
+
+/**
+ * 보상금액을 OBSP로 지급한다
+ */
+int RewordOBSP()
+{
+	int i;
+	double total_rp, obsp_unit;
+	double user_total_rp, user_reword_amount;
+
+	/* 오라클 사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+
+	/* 1RP당 보상수량을 계산한다 */
+	for ( total_rp = 0, i = 0 ; i < user_count ; i++ )
+	{
+		total_rp = total_rp + user[i].rp_snap + user[i].rp_label + user[i].rp_label_etc;
+	}
+	obsp_unit = config.obsp_per_day / total_rp;
+	Log("RewordOBSP: TotalRP[%.2lf] OBSP/Day[%.2lf] OBSP/RP[%.2lf]\n", total_rp, config.obsp_per_day, obsp_unit);
+
+	/* 보상내역을 삽입한다 */
+	for ( i = 0 ; i < user_count ; i++ )
+	{
+		user_total_rp = user[i].rp_snap + user[i].rp_label + user[i].rp_label_etc;
+		user_reword_amount = user_total_rp * obsp_unit;
+
+		EXEC SQL
+			INSERT INTO REWORD_DETAIL
+				(
+					REWORD_IDX, USER_KEY, SERIAL_NO, REWORD_AMOUNT, TOTAL_RP, SNAP_RP, LABEL_RP, LABEL_ETC_RP, COUNT_SNAP, COUNT_LABEL, COUNT_LABEL_ETC, UPDATE_TIME
+				)
+				VALUES
+				(
+					:config.reword_idx, :user[i].user_key, 0, :user_reword_amount, :user_total_rp, :user[i].rp_snap, :user[i].rp_label, :user[i].rp_label_etc, :user[i].count_snap, :user[i].count_label, :user[i].count_label_etc, sysdate
+				);
+
+		if ( _SQLNOTOK )
+		{
+			Log("RewordOBSP: 보상내역 삽입 도중 에러가 발생하였습니다 user_key[%s] sqlcode[%d]\n", user[i].user_key, sqlca.sqlcode);
+			return (-1);
+		}
+
+		Log("RewordOBSP: 보상내역삽입 user_key[%s] amount[%.2lf] total_rp[%.2lf]\n", user[i].user_key, user_reword_amount, user_total_rp);
+	}
+
+	return (0);
+}
+
+/**
+ * 보상을 완료한다
+ */
+void CompleteReword()
+{
+	double total_reword, total_rp;
+	int count_snap, count_label, count_label_etc;
+
+	/* 오라클 사용 등록 */
+	struct sqlca sqlca;
+	EXEC SQL CONTEXT USE :ctx;
+
+	/* 통계정보를 가져온다 */
+	EXEC SQL
+		SELECT NVL(SUM(REWORD_AMOUNT), 0), NVL(SUM(TOTAL_RP), 0), NVL(SUM(COUNT_SNAP), 0), NVL(SUM(COUNT_LABEL), 0), NVL(SUM(COUNT_LABEL_ETC), 0)
+		  INTO :total_reword, :total_rp, :count_snap, :count_label, :count_label_etc
+		FROM REWORD_DETAIL
+		WHERE REWORD_IDX = :config.reword_idx;
+	
+	if ( _SQLNOTOK )
+	{
+		Log("CompleteReword: 통계정보를 가져오는 도중 에러가 발생하였습니다. sqlcode[%d]\n", sqlca.sqlcode);
+		EXEC SQL ROLLBACK;
+		return;
+	}
+
+	/* 보상내역을 갱신한다 */
+	EXEC SQL UPDATE REWORD_LIST SET TOTAL_REWORD = :total_reword,
+									TOTAL_RP = :total_rp,
+									COUNT_USER = :user_count,
+									COUNT_SNAP = :count_snap,
+									COUNT_LABEL = :count_label,
+									COUNT_LABEL_ETC = :count_label_etc,
+									UNIT_SNAP_RP = :config.rp_snap,
+									UNIT_LABEL_RP = :config.rp_label,
+									UNIT_LABEL_ETC_RP = :config.rp_label_etc,
+									PROC_STATUS = 'V'
+	WHERE REWORD_IDX = :config.reword_idx;
+
+	if ( _SQLNOTOK )
+	{
+		Log("CompleteReword: 보상내역을 갱신하는 도중 에러가 발생하였습니다 sqlcode[%d]\n", sqlca.sqlcode);
+		EXEC SQL ROLLBACK;
+		return;
+	}
+
+	EXEC SQL COMMIT;
+	Log("CompleteReword: 제보 보상 완료! RewordIDX[%d]\n", config.reword_idx);
+
+	/* REDIS 유저정보를 갱신한다 */
+	UpdateUserInfoRedis();
+}
+
+/**
+ * REDIS의 사용자 통계정보를 갱신한다
+ */
+void UpdateUserInfoRedis()
+{
+	SOCKET sockfd;
+    char key[128];
+    char sndbuf[MAX_BUFFER], rcvbuf[MAX_BUFFER];
+    int idx, length;
+
+	/* 서버연결 */
+    if ( (sockfd = GetConnectSocket(syncredis_ip, syncredis_port)) == -1 )
+    {
+        Log("UpdateUserInfoRedis: 서버 접속에 실패하였습니다!! host[%s:%d] errno[%d]\n", syncredis_ip, syncredis_port, errno);
+        return;
+    }
+
+	for ( idx = 0 ; idx < user_count ; idx++ )
+	{
+		/* 보낼데이타를 세팅한다 */
+		memset(key, 0x00, 128);
+		memset(sndbuf, 0x00, MAX_BUFFER);
+		sprintf(key, "PhotoApp:UserInfo:%s:stat", user[idx].user_key);
+		sprintf(sndbuf, "%0*ld%c%s", SRI_LENGTH_SIZE, strlen(key) + 1, 'U', key);
+
+		/* 데이타를 전송한다 */
+		if ( SendTCP(sockfd, sndbuf, strlen(sndbuf), 0) == -1 )
+		{
+			Log("UpdateUserInfoRedis: 데이타 전송에 실패하였습니다. sndbuf[%s] errno[%d]\n", sndbuf, errno);
+			break;
+		}
+
+		/* 응답데이타를 읽어온다 */
+		memset(rcvbuf, 0x00, MAX_BUFFER);
+		if ( ReceiveTCP(sockfd, rcvbuf, SRI_LENGTH_SIZE, 0) <= 0 )
+		{
+			Log("UpdateUserInfoRedis: 응답 사이즈 수신에 실패하였습니다. errno[%d]\n", errno);
+			break;
+		}
+		if ( (length = atoi(rcvbuf)) > 0 )
+		{
+			if ( ReceiveTCP(sockfd, rcvbuf + SRI_LENGTH_SIZE, length, 0) <= 0 )
+			{
+				Log("UpdateUserInfoRedis: 응답 데이타 수신에 실패하였습니다. errno[%d]\n", errno);
+				break;
+			}
+		}
+
+		usleep(10000);
+	}
+
+    CloseSocket(sockfd);
+}
+
+/*************************************************************************************
+ * 초기화 함수
+ *************************************************************************************/
+
+/**
+ * 서버를 초기화한다.
+ */ 
+void InitServer()
+{
+	char db_user[32], conf_file_name[128];;
+	struct sqlca sqlca;
+	
+	/* 공유메모리를 초기화 한다. */
+	InitCommonMemory();
+	
+	/* 설정파일을 연다. */
+	sprintf(conf_file_name, "%s/%s/%s", mdb->program_home, CONF_PATH, SERVER_CONFIG_FILE);
+	if ( !OpenProfile(conf_file_name) )
+	{
+		Log("InitServer: 설정파일을 여는 도중 에러가 발생하였습니다. file[%s] errno[%d]\n", conf_file_name, errno);
+		exit(EXIT_FAILURE);
+	}
+
+	/* DB연결정보를 가져온다 */
+	GetProfileString("MAIN", "ORACLE_USER", db_user);
+	GetProfileString("SyncRedis", "SERVER_IP", syncredis_ip);
+	syncredis_port = GetProfileInt("SyncRedis", "SERVER_PORT", 0);
+
+	/* 설정파일을 닫는다. */
+	CloseProfile();
+	
+ 	/* DB에 접속한다. */
+	EXEC SQL CONTEXT ALLOCATE :ctx;
+	EXEC SQL CONTEXT USE :ctx;
+	EXEC SQL CONNECT :db_user;
+
+	/* 시스널 핸들러 설정 */
+	signal(SIGHUP, SIG_IGN);
+	signal(SIGPIPE, SIG_IGN);
+	signal(SIGINT, interrupt);
+    signal(SIGTERM, interrupt);
+    signal(SIGQUIT, interrupt);
+    
+	Log("InitServer: 서버 초기화! Process Start..................................\n");
+}
+
+/**
+ * 서버를 종료한다.
+ */
+void interrupt(int sig)
+{
+	struct sqlca sqlca;
+
+	/* 리턴코드가 에러이면 */
+	if ( sig == -1 && config.reword_idx > 0 && config.reword_idx <= 99999 )
+	{
+		EXEC SQL CONTEXT USE :ctx;
+		EXEC SQL UPDATE REWORD_LIST SET PROC_STATUS = 'Z' WHERE REWORD_IDX = :config.reword_idx;
+		EXEC SQL COMMIT;
+	}
+
+	/* 메모리해제 */
+	if ( snap ) free(snap);
+	if ( user ) free(user);
+
+	/* DB연결을 종료한다. */
+	EXEC SQL CONTEXT USE :ctx;
+	EXEC SQL COMMIT WORK RELEASE;
+	EXEC SQL CONTEXT FREE :ctx;
+	
+	/* 프로세스 등록 해제 */
+	DeAttachShm((void*)mdb);
+	
+    exit(EXIT_SUCCESS);
+}
+
